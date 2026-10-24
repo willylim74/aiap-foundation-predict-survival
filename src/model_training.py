@@ -1,390 +1,147 @@
-"""
-model_training.py — Model Training Layer
-
-Splits the cleaned data, trains every model in the config-driven registry as
-a baseline, tunes each tunable model with the strategy config.yaml assigns
-it (GridSearchCV for the models cheap enough to search exhaustively on the
-full training fold; a subsample-then-refit HalvingRandomSearchCV for the
-expensive tree ensembles), ranks everything by the configured metric, and
-evaluates the single best model on the held-out test set exactly once.
-
-This is a classification problem (EDA Section 1: binary Survive target,
-~2.1:1 class imbalance) so this module implements the classification branch
-only - stratified split, class_weight="balanced" where a model supports it,
-Accuracy/Precision/Recall/F1/ROC AUC/PR AUC, ranked by PR AUC (the correct
-ranking metric for an imbalanced problem - EDA Section 15/16).
-
-Every fitted pipeline is checkpointed to a JSON ledger + pickle file, keyed
-"<stage>::<model name>" (stage in {"baseline", "tuned"}) so the two training
-stages can share one ledger without colliding on a bare model name (e.g.
-both stages tune a "Random Forest").
-"""
-
-from __future__ import annotations
-
-import json
-import logging
-import pickle
-import time
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
+"""Baselines, tuning with a checkpoint ledger, selection and the one-time test evaluation. Everything is driven by config.yaml."""
+import hashlib, json, os, pickle, time
+import numpy as np, pandas as pd
 from sklearn.base import clone
 from sklearn.dummy import DummyClassifier
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.experimental import enable_halving_search_cv  # noqa: F401 - required to unlock HalvingRandomSearchCV
-from sklearn.linear_model import LogisticRegression, RidgeClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    average_precision_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
-from sklearn.model_selection import GridSearchCV, HalvingRandomSearchCV, train_test_split
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, average_precision_score, f1_score, log_loss, precision_score, recall_score, roc_auc_score
+from sklearn.model_selection import GridSearchCV, HalvingRandomSearchCV, StratifiedGroupKFold
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.utils.class_weight import compute_sample_weight
+from data_preparation import build_preprocessing_pipeline
 
-logger = logging.getLogger(__name__)
-
-_TYPE_TO_CLASS = {
-    "dummy": DummyClassifier,
-    "logistic_regression": LogisticRegression,
-    "ridge_classifier": RidgeClassifier,
-    "lasso_logistic": LogisticRegression,
-    "decision_tree": DecisionTreeClassifier,
-    "knn": KNeighborsClassifier,
-    "random_forest": RandomForestClassifier,
-    "gradient_boosting": GradientBoostingClassifier,
-}
+CLASSES = {c.__name__: c for c in (DummyClassifier, LogisticRegression, DecisionTreeClassifier, RandomForestClassifier, HistGradientBoostingClassifier, KNeighborsClassifier)}
+REQUIRED = ["Logistic", "DecisionTree", "RandomForest", "HistGradientBoosting", "KNN"]
 
 
-# ==============================================================================
-# Split (EDA Section 12: stratified 70/15/15)
-# ==============================================================================
-def split_data(df: pd.DataFrame, config: dict):
-    """Stratified train/validation/test split. Returns
-    (X_train, X_val, X_test, y_train, y_val, y_test). The feature matrix
-    excludes the target and the ID column (EDA Section 2/10/12: ID is not a
-    unique key and carries no clinical signal)."""
-    split_cfg = config["split"]
-    target = config["data"]["target"]
-    id_col = config["data"]["id_column"]
-
-    drop_cols = [target] + ([id_col] if id_col in df.columns else [])
-    X = df.drop(columns=drop_cols)
-    y = df[target]
-
-    stratify = y if split_cfg["stratify"] else None
-    val_test_size = split_cfg["val_size"] + split_cfg["test_size"]
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y, test_size=val_test_size, stratify=stratify, random_state=split_cfg["random_state"]
-    )
-
-    rel_test_size = split_cfg["test_size"] / val_test_size
-    stratify_temp = y_temp if split_cfg["stratify"] else None
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=rel_test_size, stratify=stratify_temp, random_state=split_cfg["random_state"]
-    )
-
-    logger.info(
-        "Split sizes: train=%d (%.1f%%, survive=%.4f)  val=%d (%.1f%%, survive=%.4f)  test=%d (%.1f%%, survive=%.4f)",
-        len(X_train), len(X_train) / len(df) * 100, y_train.mean(),
-        len(X_val), len(X_val) / len(df) * 100, y_val.mean(),
-        len(X_test), len(X_test) / len(df) * 100, y_test.mean(),
-    )
-    return X_train, X_val, X_test, y_train, y_val, y_test
+def check_registry(cfg):
+    assert set(cfg["models"]) == set(REQUIRED) | {"Naive"}, "config registry must equal the required model list + the naive benchmark"
 
 
-# ==============================================================================
-# Model registry
-# ==============================================================================
-def _build_estimator(model_cfg: dict):
-    """Instantiate the sklearn estimator for one registry entry, applying
-    base_params and class_weight="balanced" where the model config says to."""
-    cls = _TYPE_TO_CLASS[model_cfg["type"]]
-    params = dict(model_cfg.get("base_params", {}))
-    class_weight = model_cfg.get("class_weight")
-    if class_weight:
-        params["class_weight"] = class_weight
-    return cls(**params)
+def make_pipe(cfg, name, indicators=None):
+    m = cfg["models"][name]
+    return Pipeline([("prep", build_preprocessing_pipeline(cfg, indicators)), ("model", CLASSES[m["class"]](**m["params"]))])
 
 
-def build_model_registry(config: dict) -> dict:
-    """Build {name: {"estimator": ..., "family":..., "tuning_method":...,
-    "uses_sample_weight": bool, "param_grid"/"param_distributions": ...}}
-    from config['models'], including the (non-tunable) naive benchmark."""
-    registry = {}
-
-    naive_cfg = config["models"]["naive_benchmark"]
-    registry[naive_cfg["name"]] = {
-        "estimator": DummyClassifier(**naive_cfg["params"]),
-        "family": "naive",
-        "tuning_method": None,
-        "uses_sample_weight": False,
-        "tunable": False,
-    }
-
-    for model_cfg in config["models"]["registry"]:
-        registry[model_cfg["name"]] = {
-            "estimator": _build_estimator(model_cfg),
-            "family": model_cfg["family"],
-            "tuning_method": model_cfg["tuning_method"],
-            "uses_sample_weight": model_cfg.get("uses_sample_weight", False),
-            "param_grid": model_cfg.get("param_grid"),
-            "param_distributions": model_cfg.get("param_distributions"),
-            "tunable": True,
-        }
-    return registry
+def score(cfg, pipe, X, y):
+    p = pipe.predict(X); s = pipe.predict_proba(X)[:, 1]
+    return dict(accuracy=accuracy_score(y, p), precision=precision_score(y, p, zero_division=0), recall=recall_score(y, p), f1=f1_score(y, p),
+                roc_auc=roc_auc_score(y, s), pr_auc=average_precision_score(y, s))
 
 
-# ==============================================================================
-# Shared evaluation helpers
-# ==============================================================================
-def evaluate_pipeline(pipeline: Pipeline, X_ev, y_ev) -> dict:
-    """Score an already-fitted pipeline. Used identically for baseline and
-    tuned pipelines - no per-model special-casing beyond the
-    predict_proba/decision_function fallback every model needs, so nothing
-    introduced specifically for tuning can silently change what a baseline
-    number means."""
-    pred = pipeline.predict(X_ev)
-    model_step = pipeline.named_steps["model"]
-    if hasattr(model_step, "predict_proba"):
-        score = pipeline.predict_proba(X_ev)[:, 1]
-    else:
-        score = pipeline.decision_function(X_ev)
-    return {
-        "accuracy": float(accuracy_score(y_ev, pred)),
-        "precision": float(precision_score(y_ev, pred, zero_division=0)),
-        "recall": float(recall_score(y_ev, pred, zero_division=0)),
-        "f1": float(f1_score(y_ev, pred, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y_ev, score)),
-        "pr_auc": float(average_precision_score(y_ev, score)),
-    }
+def cluster_boot(y, s, groups, B=300, seed=42):
+    y, s = np.asarray(y), np.asarray(s); u, inv = np.unique(np.asarray(groups), return_inverse=True); idx = [np.where(inv == i)[0] for i in range(len(u))]
+    rng = np.random.default_rng(seed); out = []
+    for _ in range(B):
+        ix = np.concatenate([idx[i] for i in rng.integers(0, len(u), len(u))])
+        if y[ix].min() != y[ix].max(): out.append(average_precision_score(y[ix], s[ix]))
+    return np.percentile(out, [2.5, 97.5])
 
 
-def fit_and_evaluate(pipeline: Pipeline, X_tr, y_tr, X_ev, y_ev, fit_kwargs: dict | None = None):
-    """Shared fit-then-score helper. fit_kwargs (e.g. sample_weight) is
-    always supplied by the CALLER - this function makes no model-specific
-    decisions, so a tuning-only adjustment can never leak into a baseline
-    fit through this shared code path."""
-    pipeline.fit(X_tr, y_tr, **(fit_kwargs or {}))
-    return pipeline, evaluate_pipeline(pipeline, X_ev, y_ev)
+def run_baselines(cfg, X_tr, y_tr, X_va, y_va, g_va, log=print):
+    """Genuine library defaults (config params only: seeds). Class weighting is a tuning-only option."""
+    fitted, rows = {}, []
+    for name in cfg["models"]:
+        t = time.time(); p = make_pipe(cfg, name).fit(X_tr, y_tr); fitted[name] = p
+        v, tr = score(cfg, p, X_va, y_va), score(cfg, p, X_tr, y_tr); ci = cluster_boot(y_va, p.predict_proba(X_va)[:, 1], g_va, seed=cfg["split"]["seed"])
+        rows.append(dict(model=name, **{m: v[m] for m in cfg["metrics"]}, train_pr_auc=tr["pr_auc"], gap_pr_auc=tr["pr_auc"] - v["pr_auc"], pr_auc_ci_low=ci[0], pr_auc_ci_high=ci[1], fit_seconds=time.time() - t))
+        log(f"  baseline {name:22s} val PR AUC {v['pr_auc']:.4f}")
+    base = pd.DataFrame(rows).sort_values("pr_auc", ascending=False).reset_index(drop=True); base.insert(0, "rank", base.index + 1)
+    return fitted, base
 
 
-# ==============================================================================
-# Checkpoint ledger (stage::model_name -> metrics, with a pickled pipeline)
-# ==============================================================================
-class CheckpointLedger:
-    """Resumable checkpoint store. Keys are "<stage>::<model_name>" so
-    multiple training stages sharing one ledger never collide on a bare
-    model name (both "baseline" and "tuned" stages include e.g.
-    "Random Forest")."""
-
-    def __init__(self, checkpoints_dir: str | Path):
-        self.dir = Path(checkpoints_dir)
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self.ledger_path = self.dir / "ledger.json"
-
-    @staticmethod
-    def _sanitize(key: str) -> str:
-        return "".join(c if c.isalnum() or c in "-_." else "_" for c in key)
-
-    def load(self) -> dict:
-        if self.ledger_path.exists():
-            with open(self.ledger_path) as f:
-                return json.load(f)
-        return {}
-
-    def save(self, ledger: dict) -> None:
-        with open(self.ledger_path, "w") as f:
-            json.dump(ledger, f, indent=2, default=str)
-
-    def checkpoint_or_run(self, stage: str, name: str, compute_fn, force: bool = False):
-        """compute_fn() -> (fitted_pipeline, info_dict). If stage::name is
-        already checkpointed (ledger entry + pickle both present) and
-        force=False, loads and returns that instead of recomputing - this
-        is what lets an interrupted run of main.py resume without redoing
-        finished work."""
-        key = f"{stage}::{name}"
-        ledger = self.load()
-        ckpt_file = self.dir / f"{self._sanitize(key)}.pkl"
-
-        if not force and key in ledger and ckpt_file.exists():
-            with open(ckpt_file, "rb") as f:
-                pipeline = pickle.load(f)
-            logger.info("[checkpoint] %s: loaded from ledger, skipping recomputation.", key)
-            return pipeline, ledger[key]
-
-        t0 = time.time()
-        pipeline, info = compute_fn()
-        info = dict(info)
-        info["stage"] = stage
-        info["model"] = name
-        info["wall_seconds"] = round(time.time() - t0, 2)
-
-        with open(ckpt_file, "wb") as f:
-            pickle.dump(pipeline, f)
-        ledger[key] = info
-        self.save(ledger)
-        logger.info("[checkpoint] %s: computed and saved in %.2fs.", key, info["wall_seconds"])
-        return pipeline, info
+# ----------------------------------------------------------------------------- checkpoint ledger
+def fingerprint(obj): return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-# ==============================================================================
-# Baseline fitting (default hyperparameters, stage="baseline")
-# ==============================================================================
-def train_baselines(registry: dict, preprocessor: Pipeline, X_train, y_train, X_val, y_val,
-                     ledger: CheckpointLedger) -> pd.DataFrame:
-    """Fit every model in the registry with its library/config defaults
-    (no tuning) and evaluate on the validation set. class_weight="balanced"
-    is applied here because it's baked into the estimator at construction
-    time in build_model_registry - it is a registry-level imbalance
-    decision, not something this function decides on its own."""
-    rows = []
-    for name, spec in registry.items():
+class Ledger:
+    """JSON ledger + pickle checkpoints, keys 'stage::model'. An entry is reused only if its settings fingerprint matches."""
+    def __init__(self, out_dir, ckpt_subdir, ledger_file):
+        self.ckpt = os.path.join(out_dir, ckpt_subdir); self.path = os.path.join(out_dir, ledger_file); os.makedirs(self.ckpt, exist_ok=True)
+        self.data = json.load(open(self.path)) if os.path.exists(self.path) else {}
 
-        def _compute_fn(name=name, spec=spec):
-            pipe = Pipeline([("prep", clone(preprocessor)), ("model", clone(spec["estimator"]))])
-            fit_kwargs = {}
-            if spec["uses_sample_weight"]:
-                fit_kwargs["model__sample_weight"] = compute_sample_weight("balanced", y_train)
-            return fit_and_evaluate(pipe, X_train, y_train, X_val, y_val, fit_kwargs=fit_kwargs)
+    def _p(self, key): return os.path.join(self.ckpt, key.replace("::", "__") + ".pkl")
 
-        _, info = ledger.checkpoint_or_run("baseline", name, _compute_fn)
-        rows.append({"model": name, **info})
+    def get(self, key, fp):
+        if key in self.data and self.data[key].get("fingerprint") == fp and os.path.exists(self._p(key)): return pickle.load(open(self._p(key), "rb"))
+        return None
 
-    baseline_df = pd.DataFrame(rows).sort_values("pr_auc", ascending=False).reset_index(drop=True)
-    baseline_df.insert(0, "rank", range(1, len(baseline_df) + 1))
-    return baseline_df
+    def put(self, key, fp, obj, report):
+        pickle.dump(obj, open(self._p(key), "wb")); self.data[key] = {"fingerprint": fp, "report": report, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        json.dump(self.data, open(self.path, "w"), indent=1, default=str)
 
 
-# ==============================================================================
-# Hyperparameter tuning (stage="tuned")
-# ==============================================================================
-def _tune_with_grid_search(name, spec, preprocessor, X_train, y_train, X_val, y_val, config):
-    tune_cfg = config["tuning"]["grid_search"]
-    pipe = Pipeline([("prep", clone(preprocessor)), ("model", clone(spec["estimator"]))])
-    search = GridSearchCV(
-        pipe, spec["param_grid"], cv=tune_cfg["cv"], scoring=tune_cfg["scoring"], n_jobs=tune_cfg["n_jobs"]
-    )
-    fit_kwargs = {}
-    if spec["uses_sample_weight"]:
-        fit_kwargs["model__sample_weight"] = compute_sample_weight("balanced", y_train)
-    search.fit(X_train, y_train, **fit_kwargs)  # GridSearchCV refits the winner on all of X_train automatically
-
-    metrics = evaluate_pipeline(search.best_estimator_, X_val, y_val)
-    metrics["best_params"] = search.best_params_
-    metrics["cv_pr_auc"] = float(search.best_score_)
-    metrics["search_type"] = f"GridSearchCV(cv={tune_cfg['cv']}, full X_train)"
-    return search.best_estimator_, metrics
+def _cv(cfg): return StratifiedGroupKFold(cfg["tuning"]["cv_folds"], shuffle=True, random_state=cfg["split"]["seed"])
 
 
-def _tune_with_halving_subsample_refit(name, spec, preprocessor, X_train, y_train, X_val, y_val, config):
-    """Compute-constrained strategy for expensive models (EDA Section 21):
-    run HalvingRandomSearchCV on a stratified subsample of X_train to find a
-    good configuration cheaply, then refit that WINNING configuration on the
-    full training fold before it is ever scored or checkpointed."""
-    tune_cfg = config["tuning"]["halving_random_search"]
-    subsample_size = tune_cfg["subsample_size"]
-
-    X_train_sub, _, y_train_sub, _ = train_test_split(
-        X_train, y_train, train_size=subsample_size, stratify=y_train,
-        random_state=config["split"]["random_state"],
-    )
-
-    pipe = Pipeline([("prep", clone(preprocessor)), ("model", clone(spec["estimator"]))])
-    search = HalvingRandomSearchCV(
-        pipe, spec["param_distributions"],
-        factor=tune_cfg["factor"], cv=tune_cfg["cv"], scoring=tune_cfg["scoring"],
-        n_candidates=tune_cfg["n_candidates"], min_resources=tune_cfg["min_resources"],
-        random_state=config["split"]["random_state"], n_jobs=tune_cfg["n_jobs"],
-    )
-    search_fit_kwargs = {}
-    if spec["uses_sample_weight"]:
-        search_fit_kwargs["model__sample_weight"] = compute_sample_weight("balanced", y_train_sub)
-    search.fit(X_train_sub, y_train_sub, **search_fit_kwargs)
-
-    # Refit the WINNING configuration on the full training fold.
-    refit_estimator = clone(spec["estimator"]).set_params(
-        **{k.split("__", 1)[1]: v for k, v in search.best_params_.items()}
-    )
-    refit_pipe = Pipeline([("prep", clone(preprocessor)), ("model", refit_estimator)])
-    refit_fit_kwargs = {}
-    if spec["uses_sample_weight"]:
-        refit_fit_kwargs["model__sample_weight"] = compute_sample_weight("balanced", y_train)
-    fitted_pipe, metrics = fit_and_evaluate(refit_pipe, X_train, y_train, X_val, y_val, fit_kwargs=refit_fit_kwargs)
-
-    metrics["best_params"] = search.best_params_
-    metrics["subsample_cv_pr_auc"] = float(search.best_score_)
-    metrics["search_type"] = (
-        f"HalvingRandomSearchCV(subsample={subsample_size}) -> refit on full X_train"
-    )
-    return fitted_pipe, metrics
+def tuning_fingerprint(cfg, name, n_train):
+    t = cfg["tuning"]; return fingerprint(dict(space=cfg["models"][name]["grid"], search=cfg["models"][name]["search"], n_train=n_train, seed=cfg["split"]["seed"], folds=t["cv_folds"], halving=t["halving"], pipeline=t["pipeline_version"]))
 
 
-def tune_models(registry: dict, preprocessor: Pipeline, X_train, y_train, X_val, y_val,
-                 config: dict, ledger: CheckpointLedger) -> pd.DataFrame:
-    """Tune every tunable model with the strategy config.yaml assigns it.
-    The naive benchmark (tunable=False) is skipped - it has no
-    hyperparameters (EDA Section 20)."""
-    rows = []
-    for name, spec in registry.items():
-        if not spec["tunable"]:
-            continue
-
-        method = spec["tuning_method"]
-        if method == "grid_search":
-            fn = _tune_with_grid_search
-        elif method == "halving_random_search_subsample_refit":
-            fn = _tune_with_halving_subsample_refit
+def run_tuning(cfg, X_tr, y_tr, g_tr, ledger, out_dir, log=print):
+    """Grid search for the linear model, successive halving (resource = n_samples) on a training subsample for the others; the winner is refit on the FULL training split.
+    Tuned settings are applied only here (set_params on a clone); baselines are never touched."""
+    t = cfg["tuning"]; h = t["halving"]; seed = cfg["split"]["seed"]; sub_n = h["min_resources"] * h["factor"] ** 3; tuned = {}
+    os.makedirs(os.path.join(out_dir, "cv_results"), exist_ok=True)
+    for name, m in cfg["models"].items():
+        if "search" not in m: continue
+        key, fp = f"tune::{name}", tuning_fingerprint(cfg, name, len(X_tr)); hit = ledger.get(key, fp)
+        if hit is not None: log(f"  [resume] {key}"); tuned[name] = hit; continue
+        t0 = time.time(); pipe = make_pipe(cfg, name)
+        if m["search"] == "grid":
+            s = GridSearchCV(pipe, m["grid"], scoring=t["scoring"], cv=_cv(cfg), n_jobs=t["n_jobs"], refit=False); s.fit(X_tr, y_tr, groups=g_tr)
         else:
-            raise ValueError(f"Unknown tuning_method '{method}' for model '{name}'")
-
-        def _compute_fn(name=name, spec=spec, fn=fn):
-            return fn(name, spec, preprocessor, X_train, y_train, X_val, y_val, config)
-
-        _, info = ledger.checkpoint_or_run("tuned", name, _compute_fn)
-        rows.append({"model": name, **info})
-
-    tuned_df = pd.DataFrame(rows).sort_values("pr_auc", ascending=False).reset_index(drop=True)
-    tuned_df.insert(0, "rank", range(1, len(tuned_df) + 1))
-    return tuned_df
+            sub = X_tr.sample(min(sub_n, len(X_tr)), random_state=seed)
+            s = HalvingRandomSearchCV(pipe, m["grid"], resource=h["resource"], min_resources=h["min_resources"], factor=h["factor"], n_candidates=h["n_candidates"], scoring=t["scoring"],
+                                      cv=_cv(cfg), refit=False, random_state=seed, n_jobs=t["n_jobs"])
+            s.fit(sub, y_tr.loc[sub.index], groups=g_tr.loc[sub.index])
+        cvr = pd.DataFrame(s.cv_results_); bi = s.best_index_; winner = clone(pipe).set_params(**s.best_params_).fit(X_tr, y_tr)
+        out = dict(pipe=winner, best_params=s.best_params_, cv_mean=float(cvr.loc[bi, "mean_test_score"]), cv_sd=float(cvr.loc[bi, "std_test_score"]), cv_results=cvr, secs=time.time() - t0)
+        report = f"{name}: best={s.best_params_} | grouped-CV PR AUC {out['cv_mean']:.4f} +- {out['cv_sd']:.4f} | {out['secs']:.1f}s"
+        ledger.put(key, fp, out, report); cvr.drop(columns=["params"], errors="ignore").to_csv(os.path.join(out_dir, "cv_results", f"{name}.csv"), index=False); log("  [done] " + report); tuned[name] = out
+    return tuned
 
 
-# ==============================================================================
-# Final selection & one-time test evaluation
-# ==============================================================================
-def select_final_model(ledger: CheckpointLedger, registry: dict):
-    """Scan EVERY checkpointed entry (both baseline and tuned stages, every
-    model except the naive benchmark) and pick whichever has the highest
-    validation PR AUC - does not assume the tuned version always wins."""
-    all_ledger = ledger.load()
-    naive_name = next(n for n, s in registry.items() if s["family"] == "naive")
-
-    candidates = []
-    for key, entry in all_ledger.items():
-        stage, name = key.split("::", 1)
-        if name == naive_name:
-            continue
-        candidates.append({"key": key, "stage": stage, "model": name, "pr_auc": entry["pr_auc"]})
-
-    candidates_df = pd.DataFrame(candidates).sort_values("pr_auc", ascending=False).reset_index(drop=True)
-    best = candidates_df.iloc[0]
-
-    ckpt_file = ledger.dir / f"{ledger._sanitize(best['key'])}.pkl"
-    with open(ckpt_file, "rb") as f:
-        final_model = pickle.load(f)
-
-    return best, final_model, candidates_df
+# ----------------------------------------------------------------------------- selection + one-time test
+def select_candidate(cfg, fitted, tuned, X_va, y_va):
+    rows = []
+    for variant, pool in (("default", {n: p for n, p in fitted.items() if n != "Naive"}), ("tuned", {n: o["pipe"] for n, o in tuned.items()})):
+        for n, p in pool.items():
+            sv = p.predict_proba(X_va)[:, 1]; rows.append((n, variant, average_precision_score(y_va, sv), log_loss(y_va, np.clip(sv, 1e-6, 1 - 1e-6)), roc_auc_score(y_va, sv)))
+    C = pd.DataFrame(rows, columns=["model", "variant", "val_pr_auc", "val_logloss", "val_roc_auc"]).sort_values(["val_pr_auc", "val_logloss"], ascending=[False, True]).reset_index(drop=True)
+    return C, C.iloc[0]
 
 
-def evaluate_final_model(final_model: Pipeline, X_test, y_test) -> dict:
-    """The ONE-TIME test-set evaluation. Call this exactly once, on the
-    model selected by select_final_model, and never use X_test/y_test for
-    anything else (tuning, comparison, model selection)."""
-    return evaluate_pipeline(final_model, X_test, y_test)
+def final_test(cfg, sel, tuned, X_tr, y_tr, X_va, y_va, X_all, y_all, g_all, i_te, ledger, log=print):
+    """Refit on train+validation; the TEST rows are read here and only here; the result is stored in the ledger so a re-run reuses it."""
+    X_tv, y_tv = pd.concat([X_tr, X_va]), pd.concat([y_tr, y_va])
+    params = tuned[sel.model]["best_params"] if sel.variant == "tuned" else None
+    fp = fingerprint(dict(sel=(sel.model, sel.variant), params=params, n=len(X_tv), seed=cfg["split"]["seed"]))
+    TEST = ledger.get("final::test", fp)
+    if TEST is not None: log("  [resume] final::test already evaluated: stored predictions reused, test rows not touched"); return TEST
+    def sel_pipe():
+        p = make_pipe(cfg, sel.model)
+        return p.set_params(**params) if params else p
+    X_te, y_te, g_te = X_all.loc[i_te], y_all.loc[i_te], g_all.loc[i_te]
+    models = {"final": sel_pipe().fit(X_tv, y_tv), "twin": make_pipe(cfg, sel.model).fit(X_tv, y_tv), "naive": make_pipe(cfg, "Naive").fit(X_tv, y_tv)}
+    TEST = dict(index=np.asarray(X_te.index), ids=X_te["ID"].values, groups=g_te.values, y=y_te.values, pred={k: m.predict(X_te) for k, m in models.items()},
+                proba={k: m.predict_proba(X_te)[:, 1] for k, m in models.items()}, models=models, selected=(sel.model, sel.variant))
+    ledger.put("final::test", fp, TEST, f"final test evaluated once: {sel.model} ({sel.variant}) on {len(y_te)} rows"); log("  final test evaluated (once)"); return TEST
+
+
+def evaluate_test(cfg, TEST):
+    y, g = TEST["y"], TEST["groups"]; names = cfg["metrics"]
+    def met(yy, pr, s): return [accuracy_score(yy, pr), precision_score(yy, pr, zero_division=0), recall_score(yy, pr), f1_score(yy, pr), roc_auc_score(yy, s), average_precision_score(yy, s)]
+    pt = {k: dict(zip(names, met(y, TEST["pred"][k], TEST["proba"][k]))) for k in ("final", "twin", "naive")}
+    u, inv = np.unique(g, return_inverse=True); members = [np.where(inv == i)[0] for i in range(len(u))]; rng = np.random.default_rng(cfg["bootstrap"]["seed"]); boot = {k: [] for k in pt}
+    for _ in range(cfg["bootstrap"]["n"]):
+        ix = np.concatenate([members[i] for i in rng.integers(0, len(u), len(u))])
+        if y[ix].min() == y[ix].max(): continue
+        for k in pt: boot[k].append(met(y[ix], TEST["pred"][k][ix], TEST["proba"][k][ix]))
+    boot = {k: np.array(v) for k, v in boot.items()}
+    ci = {m: [float(x) for x in np.percentile(boot["final"][:, j], [2.5, 97.5])] for j, m in enumerate(names)}
+    paired = {f"{o}|{m}": [float(pt["final"][m] - pt[o][m])] + [float(x) for x in np.percentile(boot["final"][:, j] - boot[o][:, j], [2.5, 97.5])] for o in ("twin", "naive") for j, m in enumerate(names)}
+    return pt, ci, paired

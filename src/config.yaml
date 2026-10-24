@@ -1,277 +1,116 @@
-# ==============================================================================
-# config.yaml — Configuration Layer
-#
-# Single source of truth for the CAD-survival classification pipeline. Every
-# value here reflects a decision made and justified during EDA (see
-# eda.ipynb) — nothing in data_preparation.py / model_training.py / main.py
-# hardcodes a column name, split ratio, model, or hyperparameter grid; they
-# all read it from this file. Where this file and the EDA notebook could
-# ever disagree, the EDA notebook is authoritative.
-# ==============================================================================
-
-project:
-  name: "cad-survival-classification"
-  random_state: 42
-  problem_type: "classification"          # EDA Section 1: binary classification, not regression
-
-# ------------------------------------------------------------------------------
-# Data
-# ------------------------------------------------------------------------------
-data:
-  raw_path: "data/data.csv"
-  target: "Survive"                       # 0 = did not survive, 1 = survived (EDA Section 1)
-
-  # Raw label encodings found in the source file that must be unified before
-  # anything else touches them (EDA Section 2: Survive/Smoke mix "0"/"1"
-  # with "No"/"Yes"/"NO"/"YES"; Ejection Fraction mixes "Low"/"L","Normal"/"N").
-  label_maps:
-    Survive: {"0": 0, "no": 0, "1": 1, "yes": 1}
-    Smoke: {"no": "No", "yes": "Yes"}
-    "Ejection Fraction": {"l": "Low", "n": "Normal", "low": "Low", "normal": "Normal", "high": "High"}
-
-  # Column dropped as a non-feature identifier (EDA Section 2: ID is not
-  # unique - 885 collisions across 15,000 rows - and carries no clinical
-  # meaning; never used as a feature).
-  id_column: "ID"
-
-  # All raw feature columns considered before any engineering/dropping.
-  raw_feature_columns:
-    - "Gender"
-    - "Smoke"
-    - "Diabetes"
-    - "Age"
-    - "Ejection Fraction"
-    - "Sodium"
-    - "Creatinine"
-    - "Platelets"
-    - "Creatine phosphokinase"
-    - "Blood Pressure"
-    - "Hemoglobin"
-    - "Height"
-    - "Weight"
-    - "Favorite color"
-
-# ------------------------------------------------------------------------------
-# Row-level structural cleaning (EDA Section 2 / Phase 1B Section 10) - all
-# deterministic, row-local fixes applied ONCE, before the train/val/test
-# split, because none of them depend on a statistic estimated across rows.
-# ------------------------------------------------------------------------------
+# Single source of truth for the CAD survival pipeline. All relative paths are resolved against the folder that contains main.py.
+paths:
+  raw_data: data/classification_bonus_practice_data.csv
+  output_dir: outputs_prod                 # production run never writes into ./outputs (the notebook's results)
+  notebook_reference_dir: outputs          # read-only: baseline_results.csv, best_params.json, final_results.json from the notebook run
+  checkpoint_subdir: checkpoints
+  ledger_file: ledger.json
+outputs:                                   # file names inside output_dir
+  baseline_results: baseline_results.csv
+  tuned_results: tuned_results.csv
+  final_results: final_results.csv
+  final_results_json: final_results.json
+  best_params: best_params.json
+  test_predictions: test_predictions.csv
+  split_ids: split_ids.csv
+  final_model: final_model.pkl
+  manifest: run_manifest.json
+target:
+  name: Survive
+  label_map: {"0": 0, "1": 1, "No": 0, "Yes": 1}      # four spellings of two classes
+  positive_class: 1
+patient_key:                               # replicated-patient finding: ~230 patients x ~65 rows; rows of one key must never be split
+  columns: [Age, Sodium, Gender]
+  abs_columns: [Age]                       # |Age| (sign flips)
+columns:
+  drop: [ID, Favorite color]               # ID: non-unique, no signal; colour: eta2 0.0005
+  raw_feature_exclude: [patient]
 cleaning:
-  # Age has a sign-flip bug: 430 rows had negative ages whose absolute value
-  # lands right back in the normal adult range (mean ~60, IQR 50-68) -
-  # abs() is the correct fix, not row removal.
-  sign_flip_columns: ["Age"]
-  drop_duplicates: true
-  # Row-level indicator flags for missingness, computed before the split
-  # (safe: purely row-local). The IMPUTED VALUE itself is fit inside the
-  # pipeline on the training fold only (see preprocessing.missing_values).
-  missingness_indicator_columns: ["Creatinine"]
-
-# ------------------------------------------------------------------------------
-# Feature engineering & preprocessing (EDA Phase 1B Sections 11 & 13) - all
-# of this is fit exclusively inside the sklearn Pipeline built by
-# data_preparation.build_preprocessor(), so nothing here ever sees the
-# validation/test folds during fitting.
-# ------------------------------------------------------------------------------
+  smoke_case: capitalize
+  ejection_fraction_map: {L: Low, N: Normal}
+  age_abs: true                            # 430 negative ages are sign flips
+  platelet_sentinel: 263358.03             # fill value -> NaN (1,245 rows)
+  cpk_sentinel: 582                        # fill value -> NaN (2,331 rows)
+  suspect_indicators: []                   # [Creatinine_missing, Platelets_sentinel, CPK_sentinel] are outcome-dependent: OFF in the main workflow
+  suspect_indicator_candidates: [Creatinine_missing, Platelets_sentinel, CPK_sentinel]
+feature_engineering:
+  skew_threshold: 1.0                      # log1p columns learned in fit
+  log_candidates: [Creatinine, Platelets, Creatine phosphokinase]
+  bmi_cut: 33.0
+  creat_cut: 1.5
 preprocessing:
-
-  # Columns dropped as non-informative / likely-synthetic noise (EDA
-  # Sections 3-5: Height is uniformly distributed 130-189cm with r=0.006,
-  # p=0.45 vs target; Favorite color is a near-uniform 6-way split with
-  # ANOVA p=0.22 vs target).
-  noise_columns_to_drop: ["Height", "Favorite color"]
-
-  # Interaction features (EDA Section 7): Gender and Smoke each show ~no
-  # main effect on survival alone, but combine into a strong, statistically
-  # robust interaction (female smokers 74.9% survival vs. 30.4% for female
-  # non-smokers; reversed for men). Diabetes x Smoke shows a milder version
-  # of the same pattern.
-  interaction_features:
-    - name: "Gender_Smoke"
-      components: ["Gender", "Smoke"]
-    - name: "Diabetes_Smoke"
-      components: ["Diabetes", "Smoke"]
-
-  # Numeric columns split by skew (EDA Section 3): Creatinine (skew 4.33),
-  # Creatine phosphokinase (skew 4.38) and Platelets (skew 1.50) get a log1p
-  # transform after imputation/winsorizing; the rest are close to
-  # normally-shaped and are scaled directly.
-  numeric_columns:
-    skewed: ["Creatinine", "Creatine phosphokinase", "Platelets"]
-    normal: ["Age", "Sodium", "Blood Pressure", "Hemoglobin", "Weight"]
-
-  # Missingness indicator columns, passed through unchanged (already 0/1).
-  passthrough_columns: ["Creatinine_missing"]
-
-  # Categorical columns one-hot encoded (includes the two engineered
-  # interaction columns above).
-  categorical_columns: ["Gender", "Smoke", "Diabetes", "Ejection Fraction", "Gender_Smoke", "Diabetes_Smoke"]
-
-  missing_values:
-    numeric_strategy: "median"            # fit on training fold only
-    categorical_strategy: "most_frequent"
-
-  # Outlier handling (EDA Section 8): IQR-outlier rows in Sodium,
-  # Creatinine and Platelets survive at dramatically different rates than
-  # typical rows (e.g. Sodium outliers 77.8% vs. 31.5%) - i.e. extreme
-  # values are INFORMATIVE, not noise. The chosen handling is capping
-  # (winsorizing), not removal, and with a wider-than-standard multiplier
-  # so only genuinely extreme values are touched.
-  outliers:
-    method: "iqr_winsorize"
-    multiplier: 3.0                       # wider than the standard 1.5x - see EDA Section 11
-
-  scaling: "standard"                     # StandardScaler on all numeric branches
-  encoding: "onehot"                      # OneHotEncoder(handle_unknown="ignore") on categoricals
-
-# ------------------------------------------------------------------------------
-# Train / validation / test split (EDA Phase 1B Section 12)
-# ------------------------------------------------------------------------------
+  winsor_lower: 0.005
+  winsor_upper: 0.995
+  impute_strategy: median
+  scaler: standard
+  categorical_encoding: onehot_handle_unknown_ignore
 split:
-  train_size: 0.70
-  val_size: 0.15
-  test_size: 0.15
-  stratify: true                          # classification problem -> stratified split (EDA Section 12)
-  random_state: 42
-
-# ------------------------------------------------------------------------------
-# Class imbalance (EDA Section 1: ~32.1% survive vs. ~67.9% do not, ~2.1:1)
-# ------------------------------------------------------------------------------
-imbalance:
-  is_imbalanced: true
-  strategy: "class_weight_balanced"       # class_weight="balanced" on every model that supports it directly
-
-# ------------------------------------------------------------------------------
-# Model registry (EDA Phase 1B Section 14) - the naive benchmark plus every
-# classification model exercised in the EDA. Grouped by which tuning
-# strategy applies (EDA Section 20/21 benchmarked actual fit times on this
-# dataset: Logistic/Ridge/Lasso/Decision Tree/KNN each fit in seconds even
-# with a full grid on all of X_train; Random Forest/Gradient Boosting are
-# the expensive ones and use the subsample-then-refit strategy instead).
-# ------------------------------------------------------------------------------
-models:
-  naive_benchmark:
-    name: "Naive (majority class)"
-    type: "dummy"
-    params: {strategy: "most_frequent"}
-    tunable: false
-
-  registry:
-    - name: "Logistic Regression"
-      type: "logistic_regression"
-      family: "linear"
-      tuning_method: "grid_search"
-      class_weight: "balanced"
-      base_params: {max_iter: 2000, random_state: 42}
-      param_grid: {"model__C": [0.01, 0.1, 1.0, 10.0, 100.0]}
-
-    - name: "Ridge Classifier"
-      type: "ridge_classifier"
-      family: "linear"
-      tuning_method: "grid_search"
-      class_weight: "balanced"
-      base_params: {random_state: 42}
-      param_grid: {"model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0]}
-
-    - name: "Lasso (L1 Logistic)"
-      type: "lasso_logistic"
-      family: "linear"
-      tuning_method: "grid_search"
-      class_weight: "balanced"
-      base_params: {solver: "liblinear", l1_ratio: 1.0, max_iter: 2000, random_state: 42}
-      param_grid: {"model__C": [0.01, 0.1, 1.0, 10.0, 100.0]}
-
-    - name: "Decision Tree"
-      type: "decision_tree"
-      family: "tree"
-      tuning_method: "grid_search"        # fast enough on full X_train - EDA Section 20
-      class_weight: "balanced"
-      base_params: {random_state: 42}
-      param_grid:
-        "model__max_depth": [3, 5, 8, 12, null]
-        "model__min_samples_leaf": [1, 5, 10, 20]
-
-    - name: "K-Nearest Neighbors"
-      type: "knn"
-      family: "instance_based"
-      tuning_method: "grid_search"        # fast enough on full X_train - EDA Section 20
-      class_weight: null                  # KNN has no class-weighting mechanism (EDA Section 14)
-      base_params: {}
-      param_grid:
-        "model__n_neighbors": [3, 5, 7, 11, 15, 25]
-        "model__weights": ["uniform", "distance"]
-
-    - name: "Random Forest"
-      type: "random_forest"
-      family: "tree_ensemble"
-      tuning_method: "halving_random_search_subsample_refit"   # EDA Section 21
-      class_weight: "balanced"
-      base_params: {n_estimators: 300, n_jobs: -1, random_state: 42}
-      param_distributions:
-        "model__n_estimators": [80, 150, 250]
-        "model__max_depth": [null, 10, 20]
-        "model__min_samples_leaf": [1, 2, 4]
-        "model__max_features": ["sqrt", null]
-
-    - name: "Gradient Boosting"
-      type: "gradient_boosting"
-      family: "tree_ensemble"
-      tuning_method: "halving_random_search_subsample_refit"   # EDA Section 21
-      class_weight: null                  # no native class_weight - balanced via sample_weight at fit time
-      uses_sample_weight: true
-      base_params: {random_state: 42}
-      param_distributions:
-        "model__n_estimators": [80, 150, 250]
-        "model__learning_rate": [0.03, 0.05, 0.1, 0.2]
-        "model__max_depth": [2, 3, 4]
-        "model__subsample": [0.7, 0.85, 1.0]
-
-# ------------------------------------------------------------------------------
-# Hyperparameter tuning mechanics (EDA Sections 20-21)
-# ------------------------------------------------------------------------------
+  n_group_folds: 20
+  train_folds: 14
+  val_folds: 3
+  test_folds: 3
+  seed: 42
+  stratified: true
 tuning:
-  grid_search:
-    cv: 5
-    scoring: "average_precision"          # PR AUC - see evaluation.ranking_metric below
-    n_jobs: 1                             # single-CPU sandbox assumption
-
-  halving_random_search:
-    factor: 3
-    cv: 3
-    n_candidates: 10
-    min_resources: 300
-    scoring: "average_precision"
-    n_jobs: 1
-    subsample_size: 1500                  # search phase runs on this stratified subsample of X_train...
-    refit_on_full_training_set: true      # ...then the WINNING config is refit on the full X_train
-
-# ------------------------------------------------------------------------------
-# Cross-validation (used by grid_search / halving_random_search above)
-# ------------------------------------------------------------------------------
-cross_validation:
-  strategy: "stratified_k_fold"
-  n_splits: 5
-  shuffle: true
-  random_state: 42
-
-# ------------------------------------------------------------------------------
-# Evaluation (EDA Section 15: imbalanced classification -> rank by PR AUC,
-# not accuracy or plain ROC AUC)
-# ------------------------------------------------------------------------------
-evaluation:
-  metrics: ["accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc"]
-  ranking_metric: "pr_auc"
-
-# ------------------------------------------------------------------------------
-# Output locations (mirrors the EDA notebook's ./outputs convention)
-# ------------------------------------------------------------------------------
-output:
-  base_dir: "outputs"
-  checkpoints_dir: "outputs/checkpoints"
-  baseline_results_path: "outputs/baseline_results.csv"
-  tuned_results_path: "outputs/tuned_vs_baseline_results.csv"
-  all_candidates_path: "outputs/all_candidates_ranked.csv"
-  final_test_results_path: "outputs/final_test_results.json"
-  final_summary_path: "outputs/final_summary_baseline_tuned_test.csv"
-  final_model_path: "outputs/final_model.pkl"
-  log_path: "outputs/pipeline_run.log"
+  scoring: average_precision
+  cv_folds: 3
+  halving: {min_resources: 300, factor: 3, n_candidates: 27, resource: n_samples}   # rungs 300 -> 900 -> 2700 -> 8100
+  n_jobs: 1
+  blas_threads: 1
+  pipeline_version: v1
+metrics: [accuracy, precision, recall, f1, roc_auc, pr_auc]
+selection: {primary: pr_auc, tie_break: log_loss, candidates: [default, tuned]}   # fixed before tuning
+bootstrap: {n: 1000, seed: 42, unit: patient}
+reproduction: {rtol: 1.0e-6, atol: 1.0e-6}
+expected_dims:                             # real-data dimensions checked in the self-test against the notebook
+  rows: {train: 10546, val: 2196, test: 2258}
+  patient_groups: {train: 163, val: 32, test: 35}
+  processed_columns: 23
+models:
+  Naive:
+    class: DummyClassifier
+    params: {strategy: most_frequent}
+  Logistic:
+    class: LogisticRegression
+    params: {}
+    search: grid
+    grid:
+      model__C: [0.01, 0.1, 1, 10, 100, 1000]
+      model__class_weight: [null, balanced]
+  DecisionTree:
+    class: DecisionTreeClassifier
+    params: {random_state: 42}
+    search: halving
+    grid:
+      model__max_depth: [2, 3, 4, 6, 8, null]
+      model__min_samples_leaf: [1, 5, 20, 50, 100]
+      model__class_weight: [null, balanced]
+  RandomForest:
+    class: RandomForestClassifier
+    params: {random_state: 42}
+    search: halving
+    grid:
+      model__n_estimators: [100, 200, 400]
+      model__max_depth: [3, 5, 8, null]
+      model__min_samples_leaf: [1, 5, 20, 50]
+      model__max_features: [sqrt, 0.5, 1.0]
+      model__class_weight: [null, balanced]
+  HistGradientBoosting:
+    class: HistGradientBoostingClassifier
+    params: {random_state: 42}
+    search: halving
+    grid:
+      model__learning_rate: [0.03, 0.05, 0.1]
+      model__max_iter: [50, 100, 200]
+      model__max_leaf_nodes: [4, 8, 15]
+      model__min_samples_leaf: [20, 50, 100, 200]
+      model__l2_regularization: [0.0, 1.0, 10.0]
+      model__class_weight: [null, balanced]
+  KNN:
+    class: KNeighborsClassifier
+    params: {}
+    search: halving
+    grid:
+      model__n_neighbors: [5, 15, 31, 61, 101]
+      model__weights: [uniform, distance]
+      model__p: [1, 2]
